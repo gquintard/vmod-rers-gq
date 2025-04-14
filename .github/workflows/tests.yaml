@@ -20,8 +20,6 @@ jobs:
           - type: latest
           # - setup: varnish77  -- this is current latest
           - setup: varnish76
-          - setup: varnish75
-          - setup: varnish60lts
     env:
       RUST_BACKTRACE: 1
       RUSTDOCFLAGS: -D warnings
