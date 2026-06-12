@@ -5,7 +5,7 @@ use std::sync::Mutex;
 
 use lru::LruCache;
 use regex::bytes::Regex;
-use varnish::ffi::{self, vmod_priv, vmod_priv_methods, VdpAction, VMOD_PRIV_METHODS_MAGIC};
+use varnish::ffi::{self, VMOD_PRIV_METHODS_MAGIC, VdpAction, vmod_priv, vmod_priv_methods};
 use varnish::run_vtc_tests;
 use varnish::vcl::{
     Ctx, DeliveryProcCtx, DeliveryProcessor, FetchProcCtx, FetchProcessor, InitResult, LogTag,
@@ -26,22 +26,22 @@ mod rers {
     use std::sync::Mutex;
 
     use lru::LruCache;
-    use varnish::ffi::{self, vdp, vfp};
-    use varnish::vcl::{new_vdp, new_vfp, Ctx, Event};
+    use varnish::ffi::{self, VCL_STRING, vdp, vfp};
+    use varnish::vcl::{Ctx, Event, new_vdp, new_vfp};
 
-    use super::{clamp_i64_to_usize, init, Captures, Direction, Vxp};
+    use super::{Captures, Direction, Vxp, clamp_i64_to_usize, regex_cache};
 
-    impl init {
+    impl regex_cache {
         /// Build a regex store, optionally specifying its size `n` (defaults to 1000). The
         /// cache is a standard LRU cache, meaning that if we try to compile/access a regex
         /// that wouldn't fit in it, it will remove the Least Recently Used regex to make
         /// space for the newcomer.
         /// `n` will be clamped between 1 and `usize::MAX`.
         #[must_use]
-        pub fn new(#[default(1000)] cache_size: i64) -> Self {
+        pub fn init(#[default(1000)] cache_size: i64) -> Self {
             let cap =
                 NonZeroUsize::new(clamp_i64_to_usize(cache_size)).unwrap_or(NonZeroUsize::MIN);
-            init {
+            regex_cache {
                 mutexed_cache: Mutex::new(LruCache::new(cap)),
             }
         }
@@ -49,8 +49,7 @@ mod rers {
         /// Return `true` if `regex` matches on `s`
         pub fn is_match(&self, s: &str, res: &str) -> bool {
             self.get_regex(res)
-                .map(|re| re.is_match(s.as_bytes()))
-                .unwrap_or(false)
+                .is_ok_and(|re| re.is_match(s.as_bytes()))
         }
 
         /// Replace all groups matching `regex` in `s` with `sub`. If `lim` is specified,
@@ -141,29 +140,53 @@ mod rers {
         /// Return a captured group (from `capture()` or `capture_req_body()`) using its
         /// `index` or its `name`. Trying to access a non-existing group will return an
         /// empty string.
-        #[allow(clippy::unused_self)] // TODO: figure out why &self is not being used
-        pub fn group<'a>(
+        // we don't need self here because we only need access
+        // to already captured groups
+        #[allow(clippy::unused_self)]
+        #[allow(clippy::missing_safety_doc)]
+        pub unsafe fn group(
             &self,
-            #[shared_per_task] vp: &mut Option<Box<Captures<'a>>>,
+            ctx: &mut Ctx,
+            #[shared_per_task] vp: &mut Option<Box<Captures<'_>>>,
             n: i64,
-        ) -> Option<&'a [u8]> {
-            vp.as_ref()
+        ) -> VCL_STRING {
+            let Some(bytes) = vp
+                .as_ref()
                 .and_then(|c| c.caps.get(clamp_i64_to_usize(n)))
                 .map(|m| m.as_bytes())
+            else {
+                return VCL_STRING::default();
+            };
+            ctx.ws
+                .copy_bytes_with_null(bytes)
+                .map(|t| VCL_STRING(t.b))
+                .unwrap_or_default()
         }
 
         /// Return a captured (named) group (from `capture()` or `capture_req_body()`) using its
         /// `index` or its `name`. Trying to access a non-existing group will return an
         /// empty string.
-        #[allow(clippy::unused_self)] // TODO: figure out why &self is not being used
-        pub fn named_group<'a>(
+        // we don't need self here because we only need access
+        // to already captured groups
+        #[allow(clippy::unused_self)]
+        #[allow(clippy::missing_safety_doc)]
+        pub unsafe fn named_group(
             &self,
-            #[shared_per_task] vp: &mut Option<Box<Captures<'a>>>,
+            ctx: &mut Ctx,
+            #[shared_per_task] vp: &mut Option<Box<Captures<'_>>>,
             name: &str,
-        ) -> Option<&'a [u8]> {
-            vp.as_ref()
+        ) -> VCL_STRING {
+            let Some(bytes) = vp
+                .as_ref()
                 .and_then(|c| c.caps.name(name))
                 .map(|m| m.as_bytes())
+            else {
+                return VCL_STRING::default();
+            };
+            ctx.ws
+                .copy_bytes_with_null(bytes)
+                .map(|t| VCL_STRING(t.b))
+                .unwrap_or_default()
         }
 
         /// Add a regex/substitute pair to use when delivering the response body to a
@@ -229,7 +252,7 @@ mod rers {
     }
 }
 
-impl init {
+impl regex_cache {
     fn get_regex(&self, res: &str) -> Result<Regex, String> {
         let mut lru = self.mutexed_cache.lock().unwrap();
         if lru.get(res).is_none() {
@@ -272,7 +295,7 @@ impl init {
 }
 
 #[allow(non_camel_case_types)]
-pub struct init {
+pub struct regex_cache {
     mutexed_cache: Mutex<LruCache<String, Result<Regex, String>>>,
 }
 
